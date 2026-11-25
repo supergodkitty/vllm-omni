@@ -800,6 +800,9 @@ class MiniMaxH3DiTModel(nn.Module):
         from .checkpoint_quantization import FastH3NVFP4Config
 
         self._serialized_weight_map = quant_config.weight_map if isinstance(quant_config, FastH3NVFP4Config) else {}
+        from .qat import is_serialized_mxfp4
+
+        self._serialized_mxfp4 = is_serialized_mxfp4(quant_config)
         self._rope_theta = float(config_mapping.get("rope_theta", 10000.0))
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
         self.arch = arch
@@ -999,7 +1002,7 @@ class MiniMaxH3DiTModel(nn.Module):
 
     def _mark_missing_params_required(self) -> None:
         for _, param in self.named_parameters():
-            param.missing_param_init = "error"
+            param.missing_param_init = "zeros" if getattr(param, "is_checkpoint_optional", False) else "error"
 
     def _rope_local_span(self, seq_len: int) -> tuple[int, int]:
         """Return the sequence-parallel rows owned by this DiT rank."""
@@ -1082,6 +1085,14 @@ class MiniMaxH3DiTModel(nn.Module):
         source_names: set[str] = set()
         for name, loaded_weight in weights:
             layout = "plain"
+            if ".attn.sla_module." in name:
+                if name not in params:
+                    raise ValueError(f"SLA weight has no model parameter (enable SLA_ATTN): {name}")
+                if name in loaded:
+                    raise ValueError(f"duplicate MiniMax-H3 SLA weight: {name}")
+                default_weight_loader(params[name], loaded_weight)
+                loaded.add(name)
+                continue
             if diffusers_weights:
                 if name in source_names:
                     raise ValueError(f"duplicate Diffusers H3 weight: {name}")
@@ -1113,7 +1124,9 @@ class MiniMaxH3DiTModel(nn.Module):
                 # parameter, including TP slicing and online quantization.
                 weight_loader(param, loaded_weight, layout)
                 qkv_parts.setdefault(name, set()).add(layout)
-            elif name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")):
+            elif name.endswith(
+                (".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale", ".attn.qkv_proj.weight_dual_scale")
+            ):
                 # The native checkpoint groups Q/K/V per head for both the
                 # weight and its scale. Transform both before entering vLLM's
                 # loader so each scale stays aligned with its weight rows.
@@ -1154,7 +1167,7 @@ class MiniMaxH3DiTModel(nn.Module):
                     head_dim=self.arch.attention_head_dim,
                 ).T.contiguous()
                 weight_loader(param, loaded_weight)
-            elif name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale")):
+            elif name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale", ".mlp.fc1.weight_dual_scale")):
                 if name.endswith(".weight_scale") and loaded_weight.numel() == 1:
                     weight_loader(param, loaded_weight)
                 else:
@@ -1183,6 +1196,22 @@ class MiniMaxH3DiTModel(nn.Module):
             )
             default_weight_loader(params["rope.inv_freq"], rope)
             loaded.add("rope.inv_freq")
+        if getattr(self, "_serialized_mxfp4", False):
+            required_mx = {
+                name for name, param in self.named_parameters() if not getattr(param, "is_checkpoint_optional", False)
+            }
+            if missing_mx := required_mx - loaded:
+                raise ValueError(f"MiniMax-H3 MXFP4 checkpoint is missing weights: {sorted(missing_mx)}")
+        required_sla = {
+            name
+            for name, param in params.items()
+            if ".attn.sla_module." in name and getattr(param, "is_checkpoint_required", False)
+        }
+        if missing_sla := required_sla - loaded:
+            raise ValueError(f"MiniMax-H3 SLA checkpoint is missing projection weights: {sorted(missing_sla)}")
+        for name, param in params.items():
+            if ".attn.sla_module." in name and name not in loaded and getattr(param, "is_checkpoint_optional", False):
+                nn.init.zeros_(param)
         return loaded
 
     @staticmethod
